@@ -50,7 +50,7 @@ pub struct RequestIdMiddleware<S> {
     use_incoming_id: IdReuse,
 }
 
-type Generator = fn() -> HeaderValue;
+type Generator = fn() -> Uuid;
 
 /// A middleware for generating per-request unique IDs
 pub struct RequestIdentifier {
@@ -61,7 +61,7 @@ pub struct RequestIdentifier {
 
 /// Request ID that can be extracted in handlers.
 #[derive(Clone)]
-pub struct RequestId(HeaderValue);
+pub struct RequestId(Uuid);
 
 impl Display for RequestId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -81,18 +81,17 @@ impl fmt::Display for Error {
 }
 
 impl RequestId {
-    /// Get the value of the response header for this request id.
-    pub const fn header_value(&self) -> &HeaderValue {
-        &self.0
+    /// Convert to header value for setting in response headers
+    pub fn header_value(&self) -> HeaderValue {
+        HeaderValue::from_str(&self.0.to_string()).unwrap()
     }
-
-    /// Get a string representation of this ID
-    ///
-    /// # Panics
-    ///
-    /// If the header value contains non-ASCII characters
-    pub fn as_str(&self) -> &str {
-        self.0.to_str().expect("Non-ASCII IDs are not supported")
+    /// Get a Uuid representation of the RequestId
+    pub fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+    /// Get a String representation of the RequestId's Uuid
+    pub fn as_str(&self) -> String {
+        self.0.to_string()
     }
 }
 
@@ -178,21 +177,14 @@ impl Default for RequestIdentifier {
     }
 }
 
-/// Default UUID v4 based ID generator.
 #[cfg(feature = "uuid-generator")]
-fn default_generator() -> HeaderValue {
-    let uuid = Uuid::new_v4();
-    HeaderValue::from_str(&uuid.to_string())
-        // This unwrap can never fail since UUID v4 generated IDs are ASCII-only
-        .unwrap()
+fn default_generator() -> Uuid {
+    Uuid::new_v4()
 }
 
 #[cfg(feature = "uuid-v7-generator")]
-fn uuid_v7_generator() -> HeaderValue {
-    let uuid = Uuid::now_v7();
-    HeaderValue::from_str(&uuid.to_string())
-        // This unwrap can never fail since UUID v7 generated IDs are ASCII-only
-        .unwrap()
+fn uuid_v7_generator() -> Uuid {
+    Uuid::now_v7()
 }
 
 impl<S, B> Transform<S, ServiceRequest> for RequestIdentifier
@@ -235,24 +227,32 @@ where
 
     fn call(&self, request: ServiceRequest) -> Self::Future {
         let header_name = self.header_name.clone();
-        let header_value = match self.use_incoming_id {
+        let id_generator = self.id_generator;
+        let use_incoming_id = self.use_incoming_id;
+
+        // Determine the Uuid to use
+        let uuid = match use_incoming_id {
             IdReuse::UseIncoming => request
                 .headers()
                 .get(&header_name)
-                .map_or_else(self.id_generator, Clone::clone),
-            IdReuse::IgnoreIncoming => (self.id_generator)(),
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .unwrap_or_else(id_generator),
+            IdReuse::IgnoreIncoming => id_generator(),
         };
 
-        // make the id available as an extractor in route handlers
-        let request_id = RequestId(header_value.clone());
-        request.extensions_mut().insert(request_id);
+        // Insert the Uuid-wrapped RequestId into extensions for extractor support
+        let request_id = RequestId(uuid);
+        request.extensions_mut().insert(request_id.clone());
 
+        // Call the wrapped service
         let fut = self.service.call(request);
         Box::pin(async move {
             let mut response = fut.await?;
-
-            response.headers_mut().insert(header_name, header_value);
-
+            // Insert the stringified UUID into the response header
+            response
+                .headers_mut()
+                .insert(header_name, request_id.header_value());
             Ok(response)
         })
     }
@@ -280,11 +280,9 @@ mod tests {
 
     #[allow(clippy::unused_async)]
     async fn handler(id: RequestId) -> String {
-        id.as_str().to_string()
+        id.as_str()
     }
 
-    // Using a macro to reduce code duplication when initializing the test service.
-    // The return type of `test::init_service` is to complicated to create a normal function.
     macro_rules! service {
         ($middleware:expr) => {
             test::init_service(
@@ -301,6 +299,10 @@ mod tests {
         test::call_service(&service, test::TestRequest::get().uri("/").to_request()).await
     }
 
+    fn fixed_generator() -> Uuid {
+        Uuid::from_u128(0)
+    }
+
     #[actix_web::test]
     async fn default_identifier() {
         let resp = test_get(RequestIdentifier::with_uuid()).await;
@@ -310,7 +312,6 @@ mod tests {
             .map(|v| v.to_str().unwrap().to_string())
             .unwrap();
         let body: Bytes = test::read_body(resp).await;
-        let body = String::from_utf8_lossy(&body);
         assert_eq!(uid, body);
     }
 
@@ -324,23 +325,18 @@ mod tests {
             .map(|v| v.to_str().unwrap().to_string())
             .unwrap();
         let body: Bytes = test::read_body(resp).await;
-        let body = String::from_utf8_lossy(&body);
         assert_eq!(uid, body);
     }
 
     #[actix_web::test]
     async fn deterministic_identifier() {
-        let resp = test_get(RequestIdentifier::with_generator(|| {
-            HeaderValue::from_static("look ma, i'm an id")
-        }))
-        .await;
+        let resp = test_get(RequestIdentifier::with_generator(fixed_generator)).await;
         let uid = resp
             .headers()
             .get(HeaderName::from_static(DEFAULT_HEADER))
             .map(|v| v.to_str().unwrap().to_string())
             .unwrap();
         let body: Bytes = test::read_body(resp).await;
-        let body = String::from_utf8_lossy(&body);
         assert_eq!(uid, body);
     }
 
@@ -357,7 +353,6 @@ mod tests {
             .map(|v| v.to_str().unwrap().to_string())
             .unwrap();
         let body: Bytes = test::read_body(resp).await;
-        let body = String::from_utf8_lossy(&body);
         assert_eq!(uid, body);
     }
 
@@ -378,7 +373,6 @@ mod tests {
             .unwrap();
         assert_eq!(uid, uuid4);
         let body: Bytes = test::read_body(resp).await;
-        let body = String::from_utf8_lossy(&body);
         assert_eq!(body, uuid4);
     }
 
@@ -386,9 +380,8 @@ mod tests {
     async fn ignore_existing_request_id() {
         let uuid4 = Uuid::new_v4().to_string();
         let service = service!(RequestIdentifier::with_uuid()
-            // use deterministic generator so we can check, if the supplied id is
-            // ignored
-            .generator(|| HeaderValue::from_static("0")));
+            .generator(fixed_generator)
+            .use_incoming_id(IdReuse::IgnoreIncoming));
         let req = test::TestRequest::get()
             .insert_header((DEFAULT_HEADER, uuid4.as_str()))
             .uri("/")
@@ -399,9 +392,8 @@ mod tests {
             .get(HeaderName::from_static(DEFAULT_HEADER))
             .map(|v| v.to_str().unwrap().to_string())
             .unwrap();
-        assert_eq!(uid, "0");
+        assert_eq!(uid, "00000000-0000-0000-0000-000000000000");
         let body: Bytes = test::read_body(resp).await;
-        let body = String::from_utf8_lossy(&body);
-        assert_eq!(body, "0");
+        assert_eq!(body, "00000000-0000-0000-0000-000000000000");
     }
 }
